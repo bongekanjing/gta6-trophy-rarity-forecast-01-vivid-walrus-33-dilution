@@ -124,22 +124,30 @@ def round4(x: float) -> float | int:
     return int(value) if float(value).is_integer() else value
 
 
-def hours(iso: str) -> float:
-    """Hours from the game's release to an ISO 8601 UTC instant.
-
-    Days are counted with the civil-from-days formula so no date library and no
-    locale is involved.
-    """
-    y, mo, d = int(iso[0:4]), int(iso[5:7]), int(iso[8:10])
-    hh, mi, ss = int(iso[11:13]), int(iso[14:16]), int(iso[17:19])
+def _civil_days(y: int, mo: int, d: int) -> int:
+    """Days since 1970-01-01, by the civil-from-days formula."""
     yy = y - (1 if mo <= 2 else 0)
     era = (yy if yy >= 0 else yy - 399) // 400
     yoe = yy - era * 400
     doy = (153 * ((mo + 9) % 12) + 2) // 5 + d - 1
     doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
-    days = era * 146097 + doe - 719468
-    # 2026-11-19T00:00Z is day 20785 on that count.
-    return (days - 20785) * 24.0 + hh + mi / 60.0 + ss / 3600.0
+    return era * 146097 + doe - 719468
+
+
+# The game's release, 2026-11-19T00:00Z, is the origin every rate is measured
+# from.  Deriving it rather than writing a number is not fussiness: the first
+# version of this file carried a hand-computed constant that was nine days out,
+# which made every read's clock negative and clamped them all to the same point.
+# The growth fit was then fitted to a single x, and no read could be told from
+# another.  A formula cannot drift.
+RELEASE_DAY = _civil_days(2026, 11, 19)
+
+
+def hours(iso: str) -> float:
+    """Hours from the game's release to an ISO 8601 UTC instant."""
+    y, mo, d = int(iso[0:4]), int(iso[5:7]), int(iso[8:10])
+    hh, mi, ss = int(iso[11:13]), int(iso[14:16]), int(iso[17:19])
+    return (_civil_days(y, mo, d) - RELEASE_DAY) * 24.0 + hh + mi / 60.0 + ss / 3600.0
 
 
 def fit_line(xs: list[float], ys: list[float]) -> tuple[float, float, float, float]:

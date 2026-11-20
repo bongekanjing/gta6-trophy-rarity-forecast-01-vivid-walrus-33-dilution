@@ -47,15 +47,18 @@ The practice cases sit entirely inside one Exophase refresh, so on their own the
 | model | pinball loss | 90% coverage |
 |---|---|---|
 | house baseline (rate holds) | 2.119 | 0.07 |
-| this entry | **0.358** | 0.96 |
+| this entry | **0.362** | 0.96 |
 
 Coverage near 0.9 is what an honest interval should give; the baseline's 0.07 means 13 of every 14 trophies fell outside its band.
+
+`test_main.py` pins the failures that actually happened, so they cannot come back quietly. The sharpest: the file's first version carried a hand-computed scalar for the release day that was nine days out, which pushed every read's clock negative and clamped them all to the same point. The growth fit then had one x, the population ratio collapsed to 1.0, and the forecast silently became the baseline on every case whose history crossed more than one Exophase refresh — which is exactly the final's shape. The origin is now derived from the calendar, and a test asserts a week of reads maps to strictly increasing times.
 
 ## Run it
 
 ```sh
 mkdir -p out
 MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+python3 test_main.py
 ```
 
 Reads every `*.in` in the input directory and writes `<id>.out` beside it. Standard library only, Python 3.13, no network, no randomness — two runs write the same bytes.
