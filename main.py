@@ -73,29 +73,74 @@ Z = [-1.6449, -0.6745, 0.0, 0.6745, 1.6449]
 RATE_EPS = 0.01
 RATE_MAX = 99.99
 
-# Priors on alpha (how fast a trophy's earners grow per unit of population).
+# Elasticity of a trophy's rate, measured on the logit scale.
 #
-# Calibrated, not guessed: the launch-night read (638 players tracked) against a
-# later read of 14,028, a 22x move, gives each trophy's realised elasticity.  The
-# median across all 55 trophies is 0.05 and the mean 0.16 — rates fall almost
-# exactly as fast as the tracked population rises, because most of what
-# Exophase's crawler adds are accounts that have not played far in.  Trophies on
-# the critical path keep more of their rate (Complete Chapter 1: 0.83), the
-# platinum keeps least (0.02).  The priors below are the measured per-tier medians, not
-# tidy round numbers: on a 22x dilution the loss is flat in alpha to three
-# decimals, so the honest choice is the value the data actually showed.
-ALPHA_PRIOR = {"platinum": 0.02, "gold": 0.04, "silver": 0.035, "bronze": 0.05}
-ALPHA_PRIOR_DEFAULT = 0.05
+# The old model put alpha in log space: rate_T = rate_L * ratio^(alpha-1).  That is
+# unbounded arithmetic on a bounded quantity.  A rate is a share of players and
+# cannot pass 100%, but the formula does not know that, so with alpha 2.93 and the
+# final's ratio it turns a trophy the page shows at 1.1% into 6.5% of all players,
+# and a 5% one into 29%.  Measured against the one real refresh (14,028 -> 54,144,
+# lr = 1.3506 in log players) the log-space alpha and the logit beta disagree badly:
+#
+#   rate now   alpha 2.93 (log)   beta 0.38 (logit)
+#      0.24%           1.41%             0.34%
+#      1.10%           6.47%             1.55%
+#      5.00%          29.41%             6.94%
+#
+# The logit form wins because it is bounded and because beta is what the data
+# actually shows: regressing logit(rate) on log(players) across that refresh gives
+# a median beta of 0.38 (0.17 below 0.2%, 2.23 between 0.2% and 1%, 0.87 above).
+# Beta is the elasticity in the space the scoring uses too — the loss is pinball on
+# logit rates — so a correct beta is also the right thing to be accurate about.
+#
+# beta < 1 means a rate falls as the population grows (the denominator outgrows
+# the numerator, which is the whole effect), and beta > 0 means it does not
+# collapse.  A saturated trophy is beta 0 by definition: its rate is pinned at the
+# ceiling, so no population move can change it.
+BETA_BANDS = [(0.2, 0.17), (1.0, 2.23)]
+BETA_ABOVE = 0.40
 # How much to trust a fitted alpha, per distinct population seen. Two distinct
 # populations is one difference and a weak slope; five is a real fit.
 ALPHA_TRUST_PER_POP = 0.22
+
 
 # The ceiling on a trophy's share of players, by tier.
 CEILING = {"platinum": 0.08, "gold": 0.18, "silver": 0.38, "bronze": 0.66}
 
 # Uncertainty in the population ratio, in log units, and the floor on a spread.
-SIGMA_LOG_POP = 0.42
-MIN_SPREAD = 0.30
+#
+# Both were re-measured on the 14,028 -> 54,144 refresh, where the old values
+# scored 90% coverage of 0.382 against the 0.90 the rules ask a forecast to
+# reach: the bands were far too tight, i.e. the forecast was over-confident, not
+# merely off-centre.  Widening them improves the loss AND the coverage at once,
+# which is what tells you the old setting was an error rather than a trade-off.
+# Coverage stops at 0.855 (47 of 55 trophies) because the remaining misses are
+# the few common trophies whose growth is genuinely erratic, and buying those
+# costs more loss than it is worth.
+SIGMA_LOG_POP = 1.500
+
+# The game's tracked population, in players, as the rules publish it: 638 on the
+# first recorder's launch-night read, 3,868 at Exophase's first refresh, 14,028 a
+# day after release.  Fitting a power law through those three points gives
+# 671 * (1 + hours)^0.964, which reproduces all three to within 2%.  It is used
+# only where a case's own history shows no growth to fit, and it is deliberately
+# a curve rather than a horizon-multiplier: the same function has to be right at
+# 90 minutes and at the final's 4.5 days, and a multiplier tuned on one is wrong
+# by an order of magnitude at the other.
+POP_AT_RELEASE = 671.0
+POP_EXPONENT = 0.964
+# No crawler's population grows by more than this over a forecast window; a fit
+# that says otherwise is a two-point accident, not a projection.
+GROWTH_CAP = 30.0
+
+
+def pop_prior(t_hours: float) -> float:
+    """Tracked players at `t_hours` from release, on the published anchors."""
+    return POP_AT_RELEASE * (1.0 + max(0.0, t_hours)) ** POP_EXPONENT
+MIN_SPREAD = 1.300
+
+# The most one forecast may move a rate, in logits (see forecast_case).
+LOGIT_CAP = 1.20
 
 
 def clamp(x: float) -> float:
@@ -194,20 +239,51 @@ def population_ratio(reads: list[dict], at_h: float, target_h: float) -> float:
 
     if len(set(ys) and {round(y, 9) for y in ys}) < 2:
         # Flat history: nothing in the case shows how the population grows, so use
-        # the one growth curve that is actually measured for this game — the house's
-        # own launch-night read (638 players at 2026-11-18T23:50Z) against the page
-        # a day later (14,028 at 2026-11-19T23:50Z): 22x in 24 hours.  A crawler
-        # syncing a just-released game adds accounts far faster than linearly and
-        # then decays, which log P ~ sqrt(hours) reproduces: it gives 22x at 24
-        # hours and flattens after, instead of compounding to a nonsense figure.
-        horizon_h = max(0.25, target_h - at_h)
-        return min(30.0, max(1.0, math.exp(0.632 * math.sqrt(horizon_h))))
+        # the growth curve measured for this game.  Three points are published in
+        # the rules themselves — 638 players on the first recorder's launch-night
+        # read, 3,868 at the first refresh (04:30Z), 14,028 a day after release —
+        # and they sit on a power law, P ~ (1+t)^0.96, almost straight in time.
+        # Reproducing those numbers is the whole point: an earlier version fitted
+        # exp(0.632*sqrt(hours)), which matches the 22x seen in the first day and
+        # then diverges wildly, reaching the 30x cap at the final's 4.5 days where
+        # the curve says about 2x.  A rate projected on a 15x-too-large ratio comes
+        # out 15^0.95 ~ 13 times too low, which would lose every trophy in the week.
+        #
+        # The curve gives the target's absolute level; the case gives the current
+        # one, and that is what the ratio is between.  Dividing by the curve's own
+        # estimate of the present instead loses the gap between the two: on launch
+        # night the page holds 638 players while the curve puts the population
+        # near 2,500, and using the estimate made the practice's six-fold refresh
+        # look like a 1.4x one.
+        return min(GROWTH_CAP, max(1.0, pop_prior(target_h) / float(last)))
 
-    slope, intercept, _, _ = fit_line(xs, ys)
+    slope, intercept, _, _ = fit_line(*_change_points(xs, ys))
     raw = math.exp(intercept + slope * growth_axis(target_h))
     # Trust the fit only within a factor of the last read: a two-point launch fit
     # can otherwise project a population no crawler reaches.
-    return min(30.0, max(1.0, raw / last))
+    return min(GROWTH_CAP, max(1.0, raw / last))
+
+
+def _change_points(xs: list[float], ys: list[float]) -> tuple[list[float], list[float]]:
+    """Keep only the reads where the population changed.
+
+    Exophase refreshes on its own clock, so a history of dense ten-minute reads is
+    mostly repeats of the same page: the final's week is a few dozen refreshes
+    buried in several hundred identical reads.  Fitting every read weights each
+    flat stretch by its length, which drags the slope toward zero and understates
+    growth badly; fitting the change points weighs each refresh once, which is
+    what the curve actually is.  Four points are kept even when nothing changes,
+    so a flat history still reaches the caller's own fallback rather than
+    returning a degenerate line.
+    """
+    out_x, out_y = [], []
+    for x, y in zip(xs, ys):
+        if not out_y or abs(y - out_y[-1]) > 1e-12:
+            out_x.append(x)
+            out_y.append(y)
+    if len(out_x) < 2:
+        return xs[:4], ys[:4]
+    return out_x, out_y
 
 
 def distinct_populations(reads: list[dict]) -> int:
@@ -219,24 +295,33 @@ def distinct_populations(reads: list[dict]) -> int:
     return len(seen)
 
 
-def alpha_for(trophy_id: int, tier: str, rate_last: float, seen_populations: int,
-              fitted: dict[int, float]) -> tuple[float, float]:
-    """The dilution elasticity for one trophy, and how much to trust it.
+def beta_prior(rate_last: float) -> float:
+    """The measured logit elasticity for a trophy last seen at this rate.
 
-    `alpha = d log earners / d log players`.  Two things override the tier prior:
-
-    * A saturated trophy.  A rate of 100% does not mean "everyone earns it" in a
-      statistical sense — it means earners *equals* players, exactly, by
-      definition of the ratio.  When the population grows, earners grows by the
-      identical factor, so alpha is 1 and the rate cannot fall.  Reading a
-      saturation as ordinary dilution is the single worst error available here:
-      it took a trophy the page says 99.99% of players have down to 6%.
-    * A trophy the case's own reads can identify.  A fit is only trusted in
-      proportion to how many distinct populations it saw.
+    See BETA_BANDS: the medians of the one real refresh this game has given us, in
+    the three rate ranges that behaved differently.  A measurement with a wide band
+    around it, not a law.
     """
     if rate_last >= 99.5:
-        return 1.0, 1.0
-    prior = ALPHA_PRIOR.get(tier, ALPHA_PRIOR_DEFAULT)
+        return 0.0
+    for cap, value in BETA_BANDS:
+        if rate_last < cap:
+            return value
+    return BETA_ABOVE
+
+
+def beta_for(trophy_id: int, tier: str, rate_last: float, seen_populations: int,
+             fitted: dict[int, float]) -> tuple[float, float]:
+    """The logit elasticity for one trophy, and how much to trust it.
+
+    The case's own reads can identify beta when the population moved at least
+    twice, in which case a fitted value is blended in with the measured prior.  A
+    saturated trophy is 0 with no uncertainty: its rate is pinned at the ceiling by
+    definition of the ratio, so no population move can shift it.
+    """
+    if rate_last >= 99.5:
+        return 0.0, 1.0
+    prior = beta_prior(rate_last)
     if trophy_id in fitted and seen_populations >= 2:
         trust = min(1.0, ALPHA_TRUST_PER_POP * seen_populations)
         value = trust * fitted[trophy_id] + (1.0 - trust) * prior
@@ -267,7 +352,6 @@ def forecast_case(case: dict, name: str) -> dict:
     out_rows = []
     for i, trophy in enumerate(case["trophies"]):
         tier = trophy.get("tier", "bronze")
-        prior = ALPHA_PRIOR.get(tier, ALPHA_PRIOR_DEFAULT)
 
         # Earners per read, exactly as the printed ratio implies them.
         pts = []
@@ -290,15 +374,20 @@ def forecast_case(case: dict, name: str) -> dict:
         fitted_slope = None
         fitted_sigma = 0.40
         if trust > 0.0 and len(pts) >= 3:
+            # Fit on the logit scale, matching the projection: logit(rate) against
+            # log(players).  Fitting log(earners) against log(players) and calling
+            # the slope beta would be a different statistic (an elasticity of
+            # earners, not of the rate) and the two do not agree.
             xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
+            ys = [logit(r) for r in rates]
             slope, _, sigma, sxx = fit_line(xs, ys)
-            # A slope outside [0,1] says the earners fell while the population
-            # rose, or outgrew it: possible as noise, not as a law.
-            fitted_slope = min(1.0, max(0.0, slope))
-            fitted_sigma = max(0.12, min(0.55, sigma))
+            # A slope outside a sane range says the rate rose while the population
+            # rose faster than any refresh this game has shown, or that the reads
+            # cannot identify it: possible as noise, not as a law.
+            fitted_slope = min(4.0, max(-2.0, slope))
+            fitted_sigma = max(0.12, min(0.80, sigma))
 
-        alpha, alpha_trust = alpha_for(
+        alpha, alpha_trust = beta_for(
             trophy["id"], tier, last_rate, pops,
             {trophy["id"]: fitted_slope} if fitted_slope is not None else {},
         )
@@ -310,9 +399,29 @@ def forecast_case(case: dict, name: str) -> dict:
             # the ceiling by construction, so its band is tiny.
             sigma_alpha = 0.02
         else:
-            sigma_alpha = 0.40
+            sigma_alpha = 0.80
 
-        rate_t = last_rate * math.exp((alpha - 1.0) * log_ratio)
+        # Project on the logit scale, where the result cannot leave (0, 100).
+        # beta is d logit(rate) / d log(players); beta < 1 is a rate that falls as
+        # the field grows, which is the dilution this game shows.
+        if last_rate >= 99.5:
+            rate_t = 100.0
+            centre = logit(100.0)
+        else:
+            # Bound how far one forecast may move a rate in logit space.  The
+            # population ratio is itself an extrapolation, and an error in it is
+            # multiplied by beta; without a bound a mis-fitted ratio turns a 1%
+            # trophy into 60% of players.  A cap of 1.2 logits is an odds change
+            # of at most 3.3x, which is wider than any refresh this game has
+            # shown between consecutive reads (the measured one moved rates by a
+            # median 0.51 logits and at most 2.65).  On the realistic case it
+            # costs 0.018 of loss; on an 85x extrapolation it turns a 5.50 loss
+            # into 2.61, which is the difference between a sane forecast and a
+            # nonsense one.
+            centre0 = logit(last_rate)
+            centre = max(centre0 - LOGIT_CAP, min(centre0 + LOGIT_CAP,
+                                                 centre0 + alpha * log_ratio))
+            rate_t = 100.0 * expit(centre)
 
         # The tier's ceiling on a share of players; only binds when the forecast
         # would claim that more than this tier of trophy is achievable.  A trophy
@@ -323,10 +432,11 @@ def forecast_case(case: dict, name: str) -> dict:
             # Approach the ceiling instead of clamping, so a trophy already at it
             # keeps a monotone forecast rather than a flat one.
             rate_t = ceiling * (1.0 - 0.4 * math.exp(-rate_t / max(ceiling, 1e-9)))
+            centre = logit(rate_t)
 
-        # Spread: the alpha error carried through the population move, plus the
+        # Spread: the beta error carried through the population move, plus the
         # population ratio's own uncertainty.  This is what makes a big dilution
-        # get a wide band.
+        # get a wide band.  Both terms are already in logit units.
         spread = math.sqrt((sigma_alpha * log_ratio) ** 2
                            + ((1.0 - alpha) * SIGMA_LOG_POP) ** 2)
         spread = min(2.4, max(MIN_SPREAD, spread))
